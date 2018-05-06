@@ -19,6 +19,10 @@ SUCCESS_CODE = 0x03
 FAILURE_CODE = 0x04
 BIND_REQUEST_CODE = 0x05
 BIND_RESPONSE_CODE = 0x06
+CONNECT_REQUEST_CODE = 0x07
+CONNECT_RESPONSE_CODE = 0x08
+DATA_CODE = 0x09
+DISCONNECT_CODE = 0x10
 
 
 class ChapError(Exception):
@@ -51,7 +55,30 @@ class VarifyError(ChapError):
         return 'Identity or secret is incorrect'
 
 
+class ConnectIdException(ChapError):
+    def __init__(self, error_id):
+        super().__init__(self)
+        self.error_id = error_id
+
+    def __str__(self):
+        return 'Error connect_id {}'.format(self.error_id)
+
+
+class RequestIdException(ChapError):
+    def __init__(self, error_id):
+        super().__init__(self)
+        self.error_id = error_id
+
+    def __str__(self):
+        return 'Error connect_id {}'.format(self.error_id)
+
+
 class base_chap:
+    def __init__(self, loop):
+        self.connect_id = set()
+        self.loop = loop
+        self.sock = None
+        self.identifier = None
 
     @classmethod
     def check_port(cls, port):
@@ -60,27 +87,20 @@ class base_chap:
             raise argparse.ArgumentTypeError('port should be range(0, 65536)')
         return port
 
-    def send_packet(self):
-        total_sent = 0
-        while total_sent < len(self.packet):
-            sent = self.sock.send(self.packet[total_sent:])
-            if sent == 0:
-                raise RuntimeError("socket connection broken")
-            total_sent = total_sent + sent
+    async def send_packet(self, packet):
+        await self.loop.sock_sendall(self.sock, packet)
 
-    def receive_packet(self):
-        header = self.sock.recv(header_len)
+    async def receive_packet(self):
+        header = await self.loop.sock_recv(self.sock, header_len)
         if header == '':
             raise RuntimeError("socket connection broken")
-
         (code, identifier, length) = struct.unpack('!BBH', header)
-        packet = header
 
-        while len(packet) < length:
-            chunk = self.sock.recv(length - len(packet))
-            if chunk == '':
-                raise RuntimeError("socket connection broken")
-            packet = packet + chunk
+        packet = header
+        chunk = await self.loop.sock_recv(self.sock, length - header_len)
+        if chunk == '':
+            raise RuntimeError("socket connection broken")
+        packet = packet + chunk
 
         (code, identifier, length, data) = struct.unpack('!BBH' + str(length - header_len) + 's', packet)
         return {'code': code,
@@ -88,8 +108,8 @@ class base_chap:
                 'length': length,
                 'data': data}
 
-    def create_protocol_packet(self):
-        data_len = len(self.data)
+    def create_protocol_packet(self, code, data):
+        data_len = len(data)
         packet_len = header_len + data_len
 
         # Packing format:
@@ -99,94 +119,153 @@ class base_chap:
         #
         pack_format = '!BBH' + str(data_len) + 's'
 
-        if isinstance(self.data, str):
-            self.data = bytes(self.data.encode())
+        if isinstance(data, str):
+            data = bytes(data.encode())
 
-        self.packet = struct.pack(pack_format, self.code, self.identifier, packet_len, self.data)
+        return struct.pack(pack_format, code, self.identifier, packet_len, data)
+
+    async def send_data(self, data, connect_id):
+        code = DATA_CODE
+        data = connect_id + '#' + data
+        await self.send_packet(self.create_protocol_packet(code, data))
+
+    def parse_data(self, packet):
+        if packet['code'] != DATA_CODE:
+            raise ProtocolException(packet['code'])
+        if packet['identifier'] != self.identifier:
+            raise IdentifierException(packet['identifier'])
+        connect_id, data = packet['data'].decode().split('#', 1)
+        if connect_id not in self.connect_id:
+            raise ConnectIdException(connect_id)
+        print('Data from connect_id ', connect_id)
+        return connect_id, data
+
+    async def send_disconnect(self, connect_id):
+        code = DISCONNECT_CODE
+        data = connect_id
+        await self.send_packet(self.create_protocol_packet(code, data))
+
+    def parse_disconnect(self, packet):
+        if packet['code'] != DISCONNECT_CODE:
+            raise ProtocolException(packet['code'])
+        if packet['identifier'] != self.identifier:
+            raise IdentifierException(packet['identifier'])
+        connect_id = packet['data'].decode()
+        if connect_id not in self.connect_id:
+            raise ConnectIdException(connect_id)
+        print('Closing connection connect_id:', connect_id)
+        return connect_id
 
 
 class peer(base_chap):
-    def __init__(self, args):
+    def __init__(self, args, loop):
+        super().__init__(loop)
         chap_socket = args.chap_socket.split(':', 1)
         self.authenticator, self.port = chap_socket[0], base_chap.check_port(chap_socket[1])
         self.identity, self.secret = args.user_pwd.split(':', 1)
         self.remote_port = args.port
-        self.connect()
-        self.handshake()
+        self.loop.run_until_complete(self.loop.create_task(self.connect()))
+        self.loop.run_until_complete(self.loop.create_task(self.handshake()))
 
-    def connect(self):
+    async def connect(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.connect((self.authenticator, self.port))
+        self.sock.setblocking(False)
+        await self.loop.sock_connect(self.sock, (self.authenticator, self.port))
 
-    def parse_challenge(self):
-        if self.packet['code'] != CHALLENGE_CODE:
-            raise ProtocolException(self.packet['code'])
-        self.identifier = self.packet['identifier']
-        challenge_len = struct.unpack('!B', bytes((self.packet['data'][0],)))[0]
-        self.challenge = self.packet['data'][1:challenge_len + 1]
-        print("Processing challenge with identifier:", self.packet['identifier'])
+    def parse_challenge(self, packet):
+        if packet['code'] != CHALLENGE_CODE:
+            raise ProtocolException(packet['code'])
+        self.identifier = packet['identifier']
+        challenge_len = struct.unpack('!B', bytes((packet['data'][0],)))[0]
+        self.challenge = packet['data'][1:challenge_len + 1]
+        print("Processing challenge with identifier:", packet['identifier'])
 
-    def send_response(self):
+    async def send_response(self):
         response_value = hashlib.sha1((chr(self.identifier) + self.secret + str(self.challenge)).encode()).digest()
         response_value_size = struct.pack('!B', len(response_value))
-        self.data = response_value_size + response_value + self.identity.encode()
-        self.code = RESPONSE_CODE
-        self.create_protocol_packet()
+        code = RESPONSE_CODE
+        data = response_value_size + response_value + self.identity.encode()
         print("Creating response with identifier:", self.identifier)
-        self.send_packet()
+        await self.send_packet(self.create_protocol_packet(code, data))
 
-    def parse_result(self):
-        if self.packet['identifier'] != self.identifier:
-            raise IdentifierException(self.packet['identifier'])
-        if self.packet['code'] != SUCCESS_CODE and self.packet['code'] != FAILURE_CODE:
-            raise ProtocolException(self.packet['code'])
-        if self.packet['code'] == SUCCESS_CODE:
+    def parse_result(self, packet):
+        if packet['identifier'] != self.identifier:
+            raise IdentifierException(packet['identifier'])
+        if packet['code'] != SUCCESS_CODE and packet['code'] != FAILURE_CODE:
+            raise ProtocolException(packet['code'])
+        if packet['code'] == SUCCESS_CODE:
             print("Successfully authenticated!")
-        elif self.packet['code'] == FAILURE_CODE:
-            print("Could not authenticate. Reason from the authenticator:", self.packet['data'].decode())
+        elif packet['code'] == FAILURE_CODE:
+            print("Could not authenticate. Reason from the authenticator:", packet['data'].decode())
             raise VarifyError()
 
-    def send_bind_request(self):
+    async def send_bind_request(self):
         print("Start negotiate Remote Listen's port", self.remote_port)
-        self.code, self.data = BIND_REQUEST_CODE, str(self.remote_port)
-        self.create_protocol_packet()
-        self.send_packet()
+        code, data = BIND_REQUEST_CODE, str(self.remote_port)
+        await self.send_packet(self.create_protocol_packet(code, data))
 
-    def parse_bind_response(self):
-        if self.packet['code'] != BIND_RESPONSE_CODE:
-            raise ProtocolException(self.packet['code'])
-        if self.packet['identifier'] != self.identifier:
-            raise IdentifierException(self.packet['identifier'])
-        print('Remote Listen is listening at', int(self.packet['data']))
+    def parse_bind_response(self, packet):
+        if packet['code'] != BIND_RESPONSE_CODE:
+            raise ProtocolException(packet['code'])
+        if packet['identifier'] != self.identifier:
+            raise IdentifierException(packet['identifier'])
+        print('Remote Listen is listening at', int(packet['data']))
 
-    def handshake(self):
+    async def handshake(self):
         try:
-            self.packet = self.receive_packet()
-            self.parse_challenge()
-            self.send_response()
+            self.parse_challenge(await self.receive_packet())
+            await self.send_response()
 
-            self.packet = self.receive_packet()
-            self.parse_result()
-            self.send_bind_request()
+            self.parse_result(await self.receive_packet())
+            await self.send_bind_request()
 
-            self.packet = self.receive_packet()
-            self.parse_bind_response()
+            self.parse_bind_response(await self.receive_packet())
+
         except ChapError as e:
             print(e)
             self.sock.close()
             sys.exit(1)
 
+    def parse_connect_request(self, packet):
+        if packet['code'] != CONNECT_REQUEST_CODE:
+            raise ProtocolException(packet['code'])
+        if packet['identifier'] != self.identifier:
+            raise IdentifierException(packet['identifier'])
+        request_id = packet['data'].decode()
+        print('New connect from Remote Client, request_id ', request_id)
+        return request_id
+
+    async def send_connect_response(self, request_id):
+        code = CONNECT_RESPONSE_CODE
+        connect_id = self.generate_connect_id()
+        data = request_id + '#' + connect_id
+        await self.send_packet(self.create_protocol_packet(code, data))
+        return connect_id
+
+    def generate_connect_id(self):
+        id = str(random.randint(0, 1000000))
+        while id in self.connect_id:
+            id = str(random.randint(0, 1000000))
+        self.connect_id.add(id)
+        return id
+
 
 class authenticator(base_chap):
-    def __init__(self, args):
+    def __init__(self, args, loop):
+        super().__init__(loop)
         self.port = args.port
+        self.user_list = self._make_user_list(args)
+
+        self.request_id = set()
+        self.listen()
+        self.loop.run_until_complete(self.handshake())
+
+    def _make_user_list(self, args):
         user_list = {}
         for user in args.user_pwd.split(','):
             identity, secret = user.split(':', 1)
             user_list[identity] = secret
-        self.user_list = user_list
-        self.listen()
-        self.handshake()
+        return user_list
 
     def listen(self):
         self.srvsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -195,28 +274,27 @@ class authenticator(base_chap):
         print("Listening at 0.0.0.0:", self.port)
         self.srvsock.listen(1)
 
-    def send_challenge(self):
+    async def send_challenge(self):
         self.identifier = random.randint(0, 255)
         # Create some random challenge, using the hash of a string
         # composed of 60 random integer number in the range
         # [1,100000000]
         self.challenge = hashlib.sha1(''.join(map(str, random.sample(range(10000000), 60))).encode()).digest()
         challenge_size = struct.pack('!B', len(self.challenge))
-        self.data = challenge_size + self.challenge
-        self.code = CHALLENGE_CODE
-        self.create_protocol_packet()
+        code = CHALLENGE_CODE
+        data = challenge_size + self.challenge
         print("Creating challenge with identifier:", self.identifier)
-        self.send_packet()
+        await self.send_packet(self.create_protocol_packet(code, data))
 
-    def parse_response(self):
-        if self.packet['code'] != RESPONSE_CODE:
-            raise ProtocolException(self.packet['code'])
-        if self.packet['identifier'] != self.identifier:
-            raise IdentifierException(self.packet['identifier'])
-        response_len = struct.unpack('!B', bytes((self.packet['data'][0],)))[0]
-        self.response = self.packet['data'][1:response_len + 1]
-        self.identity = self.packet['data'][response_len + 1:]
-        print("Processing response with identifier:", self.packet['identifier'])
+    def parse_response(self, packet):
+        if packet['code'] != RESPONSE_CODE:
+            raise ProtocolException(packet['code'])
+        if packet['identifier'] != self.identifier:
+            raise IdentifierException(packet['identifier'])
+        response_len = struct.unpack('!B', bytes((packet['data'][0],)))[0]
+        self.response = packet['data'][1:response_len + 1]
+        self.identity = packet['data'][response_len + 1:]
+        print("Processing response with identifier:", packet['identifier'])
 
     def verify_response(self):
         print("Verifying response for identifier:", self.identifier)
@@ -229,48 +307,71 @@ class authenticator(base_chap):
                 return True
         return False
 
-    def send_result(self, valid):
+    async def send_result(self, valid):
         if valid:
-            self.code = SUCCESS_CODE
-            self.data = ''
+            code = SUCCESS_CODE
+            data = ''
             print('Verify successfully!')
         else:
-            self.code = FAILURE_CODE
-            self.data = 'Identity or secret is incorrect'
-        self.create_protocol_packet()
-        self.send_packet()
+            code = FAILURE_CODE
+            data = 'Identity or secret is incorrect'
+        await self.send_packet(self.create_protocol_packet(code, data))
 
-    def parse_bind_request(self):
-        if self.packet['code'] != BIND_REQUEST_CODE:
-            raise ProtocolException(self.packet['code'])
-        if self.packet['identifier'] != self.identifier:
-            raise IdentifierException(self.packet['identifier'])
-        self.bind_port = int(self.packet['data'])
+    def parse_bind_request(self, packet):
+        if packet['code'] != BIND_REQUEST_CODE:
+            raise ProtocolException(packet['code'])
+        if packet['identifier'] != self.identifier:
+            raise IdentifierException(packet['identifier'])
+        self.bind_port = int(packet['data'])
 
-    def send_bind_response(self):
+    async def send_bind_response(self):
         if self.bind_port == 0:
             self.bind_port = random.randint(1025, 65535)
-        self.code = BIND_RESPONSE_CODE
-        self.data = str(self.bind_port)
-        self.create_protocol_packet()
-        self.send_packet()
+        code = BIND_RESPONSE_CODE
+        data = str(self.bind_port)
+        await self.send_packet(self.create_protocol_packet(code, data))
 
-    def handshake(self):
+    async def handshake(self):
         while True:
             self.sock, addr = self.srvsock.accept()
+            self.sock.setblocking(False)
             print('Socket from ' + str(addr[0]) + ':' + str(addr[1]))
             try:
-                self.send_challenge()
-                self.packet = self.receive_packet()
-                self.parse_response()
+                await self.send_challenge()
+                self.parse_response(await self.receive_packet())
                 valid = self.verify_response()
 
-                self.send_result(valid)
+                await self.send_result(valid)
                 if not valid: raise VarifyError()
-                self.packet = self.receive_packet()
-                self.parse_bind_request()
+                self.parse_bind_request(await self.receive_packet())
 
-                self.send_bind_response()
+                await self.send_bind_response()
                 break
             except ChapError as e:
                 print(e)
+
+    async def send_connect_request(self):
+        code = CONNECT_REQUEST_CODE
+        request_id = self.generate_request_id()
+        data = request_id
+        await self.send_packet(self.create_protocol_packet(code, data))
+        return request_id
+
+    def generate_request_id(self):
+        id = str(random.randint(0, 1000000))
+        while id in self.request_id:
+            id = str(random.randint(0, 1000000))
+        self.request_id.add(id)
+        return id
+
+    def parse_connect_response(self, packet):
+        if packet['code'] != CONNECT_RESPONSE_CODE:
+            raise ProtocolException(packet['code'])
+        if packet['identifier'] != self.identifier:
+            raise IdentifierException(packet['identifier'])
+        request_id, connect_id = packet['data'].decode().split('#', 1)
+        if request_id not in self.request_id:
+            raise RequestIdException(request_id)
+        self.connect_id.add(connect_id)
+        print('Connect to Local Server successfully! Connect_id:', connect_id)
+        return request_id, connect_id
