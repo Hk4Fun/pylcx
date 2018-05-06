@@ -8,6 +8,8 @@ import struct
 import argparse
 import sys
 
+from chap_exception import *
+
 # Header = Code (1 Byte) + Identifier (1 Byte ) + Length (2 Byte )
 header_len = 4
 
@@ -25,54 +27,6 @@ DATA_CODE = 0x09
 DISCONNECT_CODE = 0x10
 
 
-class ChapError(Exception):
-    pass
-
-
-class ProtocolException(ChapError):
-    def __init__(self, error_code):
-        super().__init__(self)
-        self.error_code = error_code
-
-    def __str__(self):
-        return 'Error packet code {}'.format(self.error_code)
-
-
-class IdentifierException(ChapError):
-    def __init__(self, error_id):
-        super().__init__(self)
-        self.error_id = error_id
-
-    def __str__(self):
-        return 'Error identifier {}'.format(self.error_id)
-
-
-class VarifyError(ChapError):
-    def __init__(self, ):
-        super().__init__(self)
-
-    def __str__(self):
-        return 'Identity or secret is incorrect'
-
-
-class ConnectIdException(ChapError):
-    def __init__(self, error_id):
-        super().__init__(self)
-        self.error_id = error_id
-
-    def __str__(self):
-        return 'Error connect_id {}'.format(self.error_id)
-
-
-class RequestIdException(ChapError):
-    def __init__(self, error_id):
-        super().__init__(self)
-        self.error_id = error_id
-
-    def __str__(self):
-        return 'Error connect_id {}'.format(self.error_id)
-
-
 class base_chap:
     def __init__(self, loop):
         self.connect_id = set()
@@ -86,6 +40,27 @@ class base_chap:
         if not 0 <= port <= 65535:
             raise argparse.ArgumentTypeError('port should be range(0, 65536)')
         return port
+
+    def check_identifier(func):
+        def wrapper(*args, **kwargs):
+            self, packet = args
+            if packet['identifier'] != self.identifier:
+                raise IdentifierException(packet['identifier'])
+            return func(*args, **kwargs)
+
+        return wrapper
+
+    def check_code(code):
+        def decorator(func):
+            def wrapper(*args, **kwargs):
+                _, packet = args
+                if packet['code'] != code:
+                    raise ProtocolException(packet['code'])
+                return func(*args, **kwargs)
+
+            return wrapper
+
+        return decorator
 
     async def send_packet(self, packet):
         await self.loop.sock_sendall(self.sock, packet)
@@ -116,7 +91,7 @@ class base_chap:
         #    ! ==> use network byte order
         #    B ==> encode as a C unsigned char (8 bit character == octect)
         #    s ==> encode as a string character (in particular NNs => encode NN characters)
-        #
+
         pack_format = '!BBH' + str(data_len) + 's'
 
         if isinstance(data, str):
@@ -129,15 +104,14 @@ class base_chap:
         data = connect_id + '#' + data
         await self.send_packet(self.create_protocol_packet(code, data))
 
+    @check_code(DATA_CODE)
+    @check_identifier
     def parse_data(self, packet):
-        if packet['code'] != DATA_CODE:
-            raise ProtocolException(packet['code'])
-        if packet['identifier'] != self.identifier:
-            raise IdentifierException(packet['identifier'])
         connect_id, data = packet['data'].decode().split('#', 1)
         if connect_id not in self.connect_id:
             raise ConnectIdException(connect_id)
         print('Data from connect_id ', connect_id)
+        print('Data:', data)
         return connect_id, data
 
     async def send_disconnect(self, connect_id):
@@ -145,11 +119,9 @@ class base_chap:
         data = connect_id
         await self.send_packet(self.create_protocol_packet(code, data))
 
+    @check_code(DISCONNECT_CODE)
+    @check_identifier
     def parse_disconnect(self, packet):
-        if packet['code'] != DISCONNECT_CODE:
-            raise ProtocolException(packet['code'])
-        if packet['identifier'] != self.identifier:
-            raise IdentifierException(packet['identifier'])
         connect_id = packet['data'].decode()
         if connect_id not in self.connect_id:
             raise ConnectIdException(connect_id)
@@ -188,9 +160,8 @@ class peer(base_chap):
         print("Creating response with identifier:", self.identifier)
         await self.send_packet(self.create_protocol_packet(code, data))
 
+    @base_chap.check_identifier
     def parse_result(self, packet):
-        if packet['identifier'] != self.identifier:
-            raise IdentifierException(packet['identifier'])
         if packet['code'] != SUCCESS_CODE and packet['code'] != FAILURE_CODE:
             raise ProtocolException(packet['code'])
         if packet['code'] == SUCCESS_CODE:
@@ -204,11 +175,9 @@ class peer(base_chap):
         code, data = BIND_REQUEST_CODE, str(self.remote_port)
         await self.send_packet(self.create_protocol_packet(code, data))
 
+    @base_chap.check_code(BIND_RESPONSE_CODE)
+    @base_chap.check_identifier
     def parse_bind_response(self, packet):
-        if packet['code'] != BIND_RESPONSE_CODE:
-            raise ProtocolException(packet['code'])
-        if packet['identifier'] != self.identifier:
-            raise IdentifierException(packet['identifier'])
         print('Remote Listen is listening at', int(packet['data']))
 
     async def handshake(self):
@@ -226,23 +195,21 @@ class peer(base_chap):
             self.sock.close()
             sys.exit(1)
 
+    @base_chap.check_code(CONNECT_REQUEST_CODE)
+    @base_chap.check_identifier
     def parse_connect_request(self, packet):
-        if packet['code'] != CONNECT_REQUEST_CODE:
-            raise ProtocolException(packet['code'])
-        if packet['identifier'] != self.identifier:
-            raise IdentifierException(packet['identifier'])
         request_id = packet['data'].decode()
         print('New connect from Remote Client, request_id ', request_id)
         return request_id
 
     async def send_connect_response(self, request_id):
         code = CONNECT_RESPONSE_CODE
-        connect_id = self.generate_connect_id()
+        connect_id = self._generate_connect_id()
         data = request_id + '#' + connect_id
         await self.send_packet(self.create_protocol_packet(code, data))
         return connect_id
 
-    def generate_connect_id(self):
+    def _generate_connect_id(self):
         id = str(random.randint(0, 1000000))
         while id in self.connect_id:
             id = str(random.randint(0, 1000000))
@@ -286,11 +253,9 @@ class authenticator(base_chap):
         print("Creating challenge with identifier:", self.identifier)
         await self.send_packet(self.create_protocol_packet(code, data))
 
+    @base_chap.check_code(RESPONSE_CODE)
+    @base_chap.check_identifier
     def parse_response(self, packet):
-        if packet['code'] != RESPONSE_CODE:
-            raise ProtocolException(packet['code'])
-        if packet['identifier'] != self.identifier:
-            raise IdentifierException(packet['identifier'])
         response_len = struct.unpack('!B', bytes((packet['data'][0],)))[0]
         self.response = packet['data'][1:response_len + 1]
         self.identity = packet['data'][response_len + 1:]
@@ -317,11 +282,9 @@ class authenticator(base_chap):
             data = 'Identity or secret is incorrect'
         await self.send_packet(self.create_protocol_packet(code, data))
 
+    @base_chap.check_code(BIND_REQUEST_CODE)
+    @base_chap.check_identifier
     def parse_bind_request(self, packet):
-        if packet['code'] != BIND_REQUEST_CODE:
-            raise ProtocolException(packet['code'])
-        if packet['identifier'] != self.identifier:
-            raise IdentifierException(packet['identifier'])
         self.bind_port = int(packet['data'])
 
     async def send_bind_response(self):
@@ -352,23 +315,21 @@ class authenticator(base_chap):
 
     async def send_connect_request(self):
         code = CONNECT_REQUEST_CODE
-        request_id = self.generate_request_id()
+        request_id = self._generate_request_id()
         data = request_id
         await self.send_packet(self.create_protocol_packet(code, data))
         return request_id
 
-    def generate_request_id(self):
+    def _generate_request_id(self):
         id = str(random.randint(0, 1000000))
         while id in self.request_id:
             id = str(random.randint(0, 1000000))
         self.request_id.add(id)
         return id
 
+    @base_chap.check_code(CONNECT_RESPONSE_CODE)
+    @base_chap.check_identifier
     def parse_connect_response(self, packet):
-        if packet['code'] != CONNECT_RESPONSE_CODE:
-            raise ProtocolException(packet['code'])
-        if packet['identifier'] != self.identifier:
-            raise IdentifierException(packet['identifier'])
         request_id, connect_id = packet['data'].decode().split('#', 1)
         if request_id not in self.request_id:
             raise RequestIdException(request_id)

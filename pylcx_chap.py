@@ -12,11 +12,54 @@ class lcx:
     def __init__(self):
         self.loop = asyncio.get_event_loop()
         self.connect_id_writer_map = {}
+        self.chap = chap.base_chap(self.loop)
 
-    def disconnect(self, packet, chap):
-        connect_id = chap.parse_disconnect(packet)
+    async def dispatch(self):
+        while True:
+            packet = await self.chap.receive_packet()
+            if packet['code'] == chap.CONNECT_REQUEST_CODE:
+                await self.open_connection(packet)
+            elif packet['code'] == chap.CONNECT_RESPONSE_CODE:
+                self.handle_connect_response(packet)
+            elif packet['code'] == chap.DATA_CODE:
+                self.chap_transmit(packet)
+            elif packet['code'] == chap.DISCONNECT_CODE:
+                self.disconnect(packet)
+
+    def chap_transmit(self, packet):
+        connect_id, data = self.chap.parse_data(packet)
+        writer = self.connect_id_writer_map[connect_id]
+        writer.write(bytes(data.encode()))
+
+    async def data_transmit(self, reader, connect_id):
+        while True:
+            data = await reader.read(4096)
+            if data:
+                await self.chap.send_data(data.decode(), connect_id)
+            else:
+                if connect_id in self.connect_id_writer_map:  # 防止重复关闭
+                    await self.handle_close(connect_id)
+                break
+
+    async def handle_close(self, connect_id):
+        if isinstance(self, slave):
+            print('local server close, connect_id:', connect_id)
+        elif isinstance(self, server):
+            print('remote client close, connect_id:', connect_id)
+        await self.chap.send_disconnect(connect_id)
         writer = self.connect_id_writer_map.pop(connect_id)
         writer.close()
+
+    def disconnect(self, packet):
+        connect_id = self.chap.parse_disconnect(packet)
+        writer = self.connect_id_writer_map.pop(connect_id)
+        writer.close()
+
+    async def open_connection(self, packet):
+        raise NotImplementedError
+
+    def handle_connect_response(self, packet):
+        raise NotImplementedError
 
 
 class slave(lcx):
@@ -25,53 +68,22 @@ class slave(lcx):
         local_socket = args.local_socket.split(':', 1)
         self.conn_srv = local_socket[0]
         self.conn_port = chap.base_chap.check_port(local_socket[1])
-        self.peer = chap.peer(args, self.loop)  # handshake first
+        self.chap = self.peer = chap.peer(args, self.loop)  # handshake first
         self.loop.run_until_complete(self.loop.create_task(self.dispatch()))
-
-    async def dispatch(self):
-        while True:
-            packet = await self.peer.receive_packet()
-            if packet['code'] == chap.CONNECT_REQUEST_CODE:
-                await self.open_connection(packet)
-            elif packet['code'] == chap.DATA_CODE:
-                self.r_c2l_s(packet)
-            elif packet['code'] == chap.DISCONNECT_CODE:
-                self.disconnect(packet, self.peer)
 
     async def open_connection(self, packet):
         request_id = self.peer.parse_connect_request(packet)
         reader, writer = await asyncio.open_connection(self.conn_srv, self.conn_port, loop=self.loop)
         connect_id = await self.peer.send_connect_response(request_id)
         self.connect_id_writer_map[connect_id] = writer
-        self.loop.create_task(self.l_s2r_c(reader, connect_id))
-
-    async def l_s2r_c(self, reader, connect_id):  # local_server2remote_client
-        while True:
-            local_server_data = await reader.read(4096)
-            if local_server_data:
-                await self.peer.send_data(local_server_data.decode(), connect_id)
-            else:
-                if connect_id in self.connect_id_writer_map:  # 防止重复关闭
-                    await self.handle_local_server_close(connect_id)
-                break
-
-    async def handle_local_server_close(self, connect_id):
-        print('local server close, connect_id:', connect_id)
-        await self.peer.send_disconnect(connect_id)
-        writer = self.connect_id_writer_map.pop(connect_id)
-        writer.close()
-
-    def r_c2l_s(self, packet):  # remote_client2local_server
-        connect_id, data = self.peer.parse_data(packet)
-        writer = self.connect_id_writer_map[connect_id]
-        writer.write(bytes(data.encode()))
+        self.loop.create_task(self.data_transmit(reader, connect_id))
 
 
 class server(lcx):
     def __init__(self, args):
         super().__init__()
         self.loop = asyncio.get_event_loop()
-        self.authenticator = chap.authenticator(args, self.loop)  # handshake first
+        self.chap = self.authenticator = chap.authenticator(args, self.loop)  # handshake first
         self.request_id_remote_client_map = {}
         self.start_server()
 
@@ -91,42 +103,11 @@ class server(lcx):
         remote_client = collections.namedtuple('remote_client', ['reader', 'writer'])
         self.request_id_remote_client_map[request_id] = remote_client._make([reader, writer])
 
-    async def dispatch(self):
-        while True:
-            packet = await self.authenticator.receive_packet()
-            if packet['code'] == chap.CONNECT_RESPONSE_CODE:
-                self.handle_connect_response(packet)
-            elif packet['code'] == chap.DATA_CODE:
-                self.l_s2r_c(packet)
-            elif packet['code'] == chap.DISCONNECT_CODE:
-                self.disconnect(packet, self.authenticator)
-
     def handle_connect_response(self, packet):
         request_id, connect_id = self.authenticator.parse_connect_response(packet)
         remote_client = self.request_id_remote_client_map.pop(request_id)
         self.connect_id_writer_map[connect_id] = remote_client.writer
-        self.loop.create_task(self.r_c2l_s(remote_client.reader, connect_id))
-
-    async def r_c2l_s(self, reader, connect_id):
-        while True:
-            remote_client_data = await reader.read(4096)
-            if remote_client_data:
-                await self.authenticator.send_data(remote_client_data.decode(), connect_id)
-            else:
-                if connect_id in self.connect_id_writer_map:  # 防止重复关闭
-                    await self.handle_remote_client_close(connect_id)
-                break
-
-    async def handle_remote_client_close(self, connect_id):
-        print('remote client close, connect_id:', connect_id)
-        await self.authenticator.send_disconnect(connect_id)
-        writer = self.connect_id_writer_map.pop(connect_id)
-        writer.close()
-
-    def l_s2r_c(self, packet):
-        connect_id, data = self.authenticator.parse_data(packet)
-        writer = self.connect_id_writer_map[connect_id]
-        writer.write(bytes(data.encode()))
+        self.loop.create_task(self.data_transmit(remote_client.reader, connect_id))
 
 
 def arg_parse():
