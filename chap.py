@@ -68,20 +68,24 @@ class base_chap:
         self.writer.write(packet)
 
     async def receive_packet(self):
-        header = await self.reader.readexactly(header_len)
-        if header == '': raise RuntimeError("socket connection broken")
-        (code, identifier, length) = struct.unpack('!BBH', header)
+        try:
+            header = await self.reader.readexactly(header_len)
+        except asyncio.streams.IncompleteReadError:
+            return
+        else:
+            if header == '': raise RuntimeError("socket connection broken")
+            (code, identifier, length) = struct.unpack('!BBH', header)
 
-        packet = header
-        chunk = await self.reader.readexactly(length - header_len)
-        if chunk == '': raise RuntimeError("socket connection broken")
-        packet = packet + chunk
+            packet = header
+            chunk = await self.reader.readexactly(length - header_len)
+            if chunk == '': raise RuntimeError("socket connection broken")
+            packet = packet + chunk
 
-        (code, identifier, length, data) = struct.unpack('!BBH' + str(length - header_len) + 's', packet)
-        return {'code': code,
-                'identifier': identifier,
-                'length': length,
-                'data': data}
+            (code, identifier, length, data) = struct.unpack('!BBH' + str(length - header_len) + 's', packet)
+            return {'code': code,
+                    'identifier': identifier,
+                    'length': length,
+                    'data': data}
 
     def create_protocol_packet(self, code, data):
         data_len = len(data)

@@ -4,9 +4,12 @@ __date__ = '2018/5/4 12:39'
 import argparse
 import asyncio
 import collections
+import signal
+import functools
+import sys
 
 import chap
-
+import chap_exception
 
 class lcx:
     def __init__(self, loop):
@@ -15,16 +18,25 @@ class lcx:
         self.chap = chap.base_chap(self.loop)
 
     async def dispatch(self):
-        while True:
-            packet = await self.chap.receive_packet()
-            if packet['code'] == chap.CONNECT_REQUEST_CODE:
-                await self.open_connection(packet)
-            elif packet['code'] == chap.CONNECT_RESPONSE_CODE:
-                self.handle_connect_response(packet)
-            elif packet['code'] == chap.DATA_CODE:
-                self.chap_transmit(packet)
-            elif packet['code'] == chap.DISCONNECT_CODE:
-                self.disconnect(packet)
+        try:
+            while True:
+                packet = await self.chap.receive_packet()
+                if packet:
+                    if packet['code'] == chap.CONNECT_REQUEST_CODE:
+                        await self.open_connection(packet)
+                    elif packet['code'] == chap.CONNECT_RESPONSE_CODE:
+                        self.handle_connect_response(packet)
+                    elif packet['code'] == chap.DATA_CODE:
+                        self.chap_transmit(packet)
+                    elif packet['code'] == chap.DISCONNECT_CODE:
+                        self.disconnect(packet)
+                    else:
+                        raise chap_exception.ProtocolException(packet['code'])
+                else:
+                    print('Connection closed!')
+                    return
+        except chap_exception.ProtocolException:
+            return
 
     def chap_transmit(self, packet):
         connect_id, data = self.chap.parse_data(packet)
@@ -37,7 +49,7 @@ class lcx:
             if data:
                 self.chap.send_data(data.decode(), connect_id)
             else:
-                if connect_id in self.connect_id_writer_map:  # 防止重复关闭
+                if connect_id in self.connect_id_writer_map:  # prevent reclosing
                     self.handle_close(connect_id)
                 break
 
@@ -92,12 +104,16 @@ class server(lcx):
         self.start_server()
 
     def start_server(self):
-        coro = asyncio.start_server(self.handle_connect, '0.0.0.0',
-                                    self.authenticator.bind_port,
-                                    loop=self.loop)
-        self.server = self.loop.run_until_complete(coro)
-        print('listening at 0.0.0.0:{}......'.format(self.authenticator.bind_port))
-        self.loop.run_until_complete(self.dispatch())
+        try:
+            coro = asyncio.start_server(self.handle_connect, '0.0.0.0',
+                                        self.authenticator.bind_port,
+                                        loop=self.loop)
+        except AttributeError: # self.authenticator.bind_port
+            return
+        else:
+            self.server = self.loop.run_until_complete(coro)
+            print('listening at 0.0.0.0:{}......'.format(self.authenticator.bind_port))
+            self.loop.run_until_complete(self.dispatch())
 
     def handle_connect(self, reader, writer):
         peer_host, peer_port, = writer.get_extra_info('peername')
@@ -118,8 +134,8 @@ class server(lcx):
 
 def arg_parse():
     example = '''example: 
-            python pylcx_chap.py -m listen -p 8000 -u u1:p1,u2:p2
-            python pylcx_chap.py -m slave -r 127.0.0.1:8000 -u u1:p1 -p 8001 -l 127.0.0.1:8002'''
+    python pylcx_chap.py -m listen -p 8000 -u u1:p1,u2:p2
+    python pylcx_chap.py -m slave -r 127.0.0.1:8000 -u u1:p1 -p 8001 -l 127.0.0.1:8002'''
     parser = argparse.ArgumentParser(formatter_class=argparse.RawDescriptionHelpFormatter,
                                      description='async LCX with CHAP',
                                      epilog=example)
@@ -136,21 +152,26 @@ def arg_parse():
     return parser.parse_args()
 
 
+def stopper(signame, loop):
+    print("Got CTRL+C, stopping...")
+    for task in asyncio.Task.all_tasks():
+        task.cancel()
+    loop.stop()
+    loop.remove_signal_handler(signal.SIGINT)
+    sys.exit()
+
+
 def main():
     loop = asyncio.get_event_loop()
+    # https://bugs.python.org/issue23057
+    # https://github.com/python/asyncio/issues/191
+    loop.add_signal_handler(getattr(signal, 'SIGINT'), functools.partial(stopper, 'SIGINT', loop))
     args = arg_parse()
-    try:
-        if args.mode == 'listen':
-            server(args, loop)
-        elif args.mode == 'slave':
-            slave(args, loop)
-    except KeyboardInterrupt:
-        for task in asyncio.Task.all_tasks():
-            task.cancel()
-        loop.stop()
-        loop.run_forever()
-    finally:
-        loop.close()
+
+    if args.mode == 'listen':
+        server(args, loop)
+    elif args.mode == 'slave':
+        slave(args, loop)
 
 
 if __name__ == '__main__':
