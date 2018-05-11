@@ -7,6 +7,7 @@ import socket
 import struct
 import argparse
 import sys
+import asyncio
 
 from chap_exception import *
 
@@ -31,7 +32,8 @@ class base_chap:
     def __init__(self, loop):
         self.connect_id = set()
         self.loop = loop
-        self.sock = None
+        self.reader = None
+        self.writer = None
         self.identifier = None
 
     @classmethod
@@ -62,19 +64,17 @@ class base_chap:
 
         return decorator
 
-    async def send_packet(self, packet):
-        await self.loop.sock_sendall(self.sock, packet)
+    def send_packet(self, packet):
+        self.writer.write(packet)
 
     async def receive_packet(self):
-        header = await self.loop.sock_recv(self.sock, header_len)
-        if header == '':
-            raise RuntimeError("socket connection broken")
+        header = await self.reader.readexactly(header_len)
+        if header == '': raise RuntimeError("socket connection broken")
         (code, identifier, length) = struct.unpack('!BBH', header)
 
         packet = header
-        chunk = await self.loop.sock_recv(self.sock, length - header_len)
-        if chunk == '':
-            raise RuntimeError("socket connection broken")
+        chunk = await self.reader.readexactly(length - header_len)
+        if chunk == '': raise RuntimeError("socket connection broken")
         packet = packet + chunk
 
         (code, identifier, length, data) = struct.unpack('!BBH' + str(length - header_len) + 's', packet)
@@ -99,10 +99,10 @@ class base_chap:
 
         return struct.pack(pack_format, code, self.identifier, packet_len, data)
 
-    async def send_data(self, data, connect_id):
+    def send_data(self, data, connect_id):
         code = DATA_CODE
         data = connect_id + '#' + data
-        await self.send_packet(self.create_protocol_packet(code, data))
+        self.send_packet(self.create_protocol_packet(code, data))
 
     @check_code(DATA_CODE)
     @check_identifier
@@ -114,10 +114,10 @@ class base_chap:
         print('Data:', data)
         return connect_id, data
 
-    async def send_disconnect(self, connect_id):
+    def send_disconnect(self, connect_id):
         code = DISCONNECT_CODE
         data = connect_id
-        await self.send_packet(self.create_protocol_packet(code, data))
+        self.send_packet(self.create_protocol_packet(code, data))
 
     @check_code(DISCONNECT_CODE)
     @check_identifier
@@ -136,13 +136,19 @@ class peer(base_chap):
         self.authenticator, self.port = chap_socket[0], base_chap.check_port(chap_socket[1])
         self.identity, self.secret = args.user_pwd.split(':', 1)
         self.remote_port = args.port
-        self.loop.run_until_complete(self.loop.create_task(self.connect()))
-        self.loop.run_until_complete(self.loop.create_task(self.handshake()))
+        self.loop.run_until_complete(self.connect())
+        self.loop.run_until_complete(self.handshake())
 
     async def connect(self):
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.setblocking(False)
-        await self.loop.sock_connect(self.sock, (self.authenticator, self.port))
+        wait_time = 2
+        while True:
+            try:
+                self.reader, self.writer = await asyncio.open_connection(self.authenticator,
+                                                                         self.port, loop=self.loop)
+                break
+            except ConnectionRefusedError:
+                print('Can not connect {}:{}, try again......'.format(self.authenticator, self.port))
+                asyncio.sleep(wait_time)
 
     def parse_challenge(self, packet):
         if packet['code'] != CHALLENGE_CODE:
@@ -152,13 +158,13 @@ class peer(base_chap):
         self.challenge = packet['data'][1:challenge_len + 1]
         print("Processing challenge with identifier:", packet['identifier'])
 
-    async def send_response(self):
+    def send_response(self):
         response_value = hashlib.sha1((chr(self.identifier) + self.secret + str(self.challenge)).encode()).digest()
         response_value_size = struct.pack('!B', len(response_value))
         code = RESPONSE_CODE
         data = response_value_size + response_value + self.identity.encode()
         print("Creating response with identifier:", self.identifier)
-        await self.send_packet(self.create_protocol_packet(code, data))
+        self.send_packet(self.create_protocol_packet(code, data))
 
     @base_chap.check_identifier
     def parse_result(self, packet):
@@ -170,10 +176,10 @@ class peer(base_chap):
             print("Could not authenticate. Reason from the authenticator:", packet['data'].decode())
             raise VarifyError()
 
-    async def send_bind_request(self):
+    def send_bind_request(self):
         print("Start negotiate Remote Listen's port", self.remote_port)
         code, data = BIND_REQUEST_CODE, str(self.remote_port)
-        await self.send_packet(self.create_protocol_packet(code, data))
+        self.send_packet(self.create_protocol_packet(code, data))
 
     @base_chap.check_code(BIND_RESPONSE_CODE)
     @base_chap.check_identifier
@@ -183,16 +189,16 @@ class peer(base_chap):
     async def handshake(self):
         try:
             self.parse_challenge(await self.receive_packet())
-            await self.send_response()
+            self.send_response()
 
             self.parse_result(await self.receive_packet())
-            await self.send_bind_request()
+            self.send_bind_request()
 
             self.parse_bind_response(await self.receive_packet())
 
         except ChapError as e:
             print(e)
-            self.sock.close()
+            self.writer.close()
             sys.exit(1)
 
     @base_chap.check_code(CONNECT_REQUEST_CODE)
@@ -202,11 +208,12 @@ class peer(base_chap):
         print('New connect from Remote Client, request_id ', request_id)
         return request_id
 
-    async def send_connect_response(self, request_id):
+    def send_connect_response(self, request_id, result):
         code = CONNECT_RESPONSE_CODE
-        connect_id = self._generate_connect_id()
-        data = request_id + '#' + connect_id
-        await self.send_packet(self.create_protocol_packet(code, data))
+        connect_id = '0'
+        if result: connect_id = self._generate_connect_id()
+        data = request_id + '#' + ['0', '1'][result] + '#' + connect_id
+        self.send_packet(self.create_protocol_packet(code, data))
         return connect_id
 
     def _generate_connect_id(self):
@@ -222,10 +229,8 @@ class authenticator(base_chap):
         super().__init__(loop)
         self.port = args.port
         self.user_list = self._make_user_list(args)
-
         self.request_id = set()
-        self.listen()
-        self.loop.run_until_complete(self.handshake())
+        self.start_server()
 
     def _make_user_list(self, args):
         user_list = {}
@@ -234,14 +239,21 @@ class authenticator(base_chap):
             user_list[identity] = secret
         return user_list
 
-    def listen(self):
-        self.srvsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.srvsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.srvsock.bind(('', self.port))  # Host == '' means any local IP address
-        print("Listening at 0.0.0.0:", self.port)
-        self.srvsock.listen(1)
+    def start_server(self):
+        coro = asyncio.start_server(self.handle_connect, '0.0.0.0', self.port, loop=self.loop)
+        self.server = self.loop.run_until_complete(coro)
+        print('Listening at 0.0.0.0:{}......'.format(self.port))
+        self.loop.run_forever()
 
-    async def send_challenge(self):
+    async def handle_connect(self, reader, writer):
+        self.reader, self.writer = reader, writer
+        peer_host, peer_port, = writer.get_extra_info('peername')
+        print('Connection from: {}:{}'.format(peer_host, peer_port))
+        self.server.close()  # only one chap connection at a time
+        await self.handshake()
+        self.loop.stop()  # handshake over
+
+    def send_challenge(self):
         self.identifier = random.randint(0, 255)
         # Create some random challenge, using the hash of a string
         # composed of 60 random integer number in the range
@@ -251,7 +263,7 @@ class authenticator(base_chap):
         code = CHALLENGE_CODE
         data = challenge_size + self.challenge
         print("Creating challenge with identifier:", self.identifier)
-        await self.send_packet(self.create_protocol_packet(code, data))
+        self.send_packet(self.create_protocol_packet(code, data))
 
     @base_chap.check_code(RESPONSE_CODE)
     @base_chap.check_identifier
@@ -272,7 +284,7 @@ class authenticator(base_chap):
                 return True
         return False
 
-    async def send_result(self, valid):
+    def send_result(self, valid):
         if valid:
             code = SUCCESS_CODE
             data = ''
@@ -280,44 +292,39 @@ class authenticator(base_chap):
         else:
             code = FAILURE_CODE
             data = 'Identity or secret is incorrect'
-        await self.send_packet(self.create_protocol_packet(code, data))
+        self.send_packet(self.create_protocol_packet(code, data))
 
     @base_chap.check_code(BIND_REQUEST_CODE)
     @base_chap.check_identifier
     def parse_bind_request(self, packet):
         self.bind_port = int(packet['data'])
 
-    async def send_bind_response(self):
+    def send_bind_response(self):
         if self.bind_port == 0:
             self.bind_port = random.randint(1025, 65535)
         code = BIND_RESPONSE_CODE
         data = str(self.bind_port)
-        await self.send_packet(self.create_protocol_packet(code, data))
+        self.send_packet(self.create_protocol_packet(code, data))
 
     async def handshake(self):
-        while True:
-            self.sock, addr = self.srvsock.accept()
-            self.sock.setblocking(False)
-            print('Socket from ' + str(addr[0]) + ':' + str(addr[1]))
-            try:
-                await self.send_challenge()
-                self.parse_response(await self.receive_packet())
-                valid = self.verify_response()
+        try:
+            self.send_challenge()
+            self.parse_response(await self.receive_packet())
+            valid = self.verify_response()
 
-                await self.send_result(valid)
-                if not valid: raise VarifyError()
-                self.parse_bind_request(await self.receive_packet())
+            self.send_result(valid)
+            if not valid: raise VarifyError()
+            self.parse_bind_request(await self.receive_packet())
 
-                await self.send_bind_response()
-                break
-            except ChapError as e:
-                print(e)
+            self.send_bind_response()
+        except ChapError as e:
+            print(e)
 
-    async def send_connect_request(self):
+    def send_connect_request(self):
         code = CONNECT_REQUEST_CODE
         request_id = self._generate_request_id()
         data = request_id
-        await self.send_packet(self.create_protocol_packet(code, data))
+        self.send_packet(self.create_protocol_packet(code, data))
         return request_id
 
     def _generate_request_id(self):
@@ -330,9 +337,13 @@ class authenticator(base_chap):
     @base_chap.check_code(CONNECT_RESPONSE_CODE)
     @base_chap.check_identifier
     def parse_connect_response(self, packet):
-        request_id, connect_id = packet['data'].decode().split('#', 1)
+        request_id, result, connect_id = packet['data'].decode().split('#', 2)
         if request_id not in self.request_id:
             raise RequestIdException(request_id)
-        self.connect_id.add(connect_id)
-        print('Connect to Local Server successfully! Connect_id:', connect_id)
-        return request_id, connect_id
+        result = int(result)
+        if result:
+            self.connect_id.add(connect_id)
+            print('Connect to Local Server successfully! Connect_id:', connect_id)
+        else:
+            print('Connect to Local Server failed!')
+        return request_id, result, connect_id

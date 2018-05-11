@@ -9,8 +9,8 @@ import chap
 
 
 class lcx:
-    def __init__(self):
-        self.loop = asyncio.get_event_loop()
+    def __init__(self, loop):
+        self.loop = loop
         self.connect_id_writer_map = {}
         self.chap = chap.base_chap(self.loop)
 
@@ -35,18 +35,18 @@ class lcx:
         while True:
             data = await reader.read(4096)
             if data:
-                await self.chap.send_data(data.decode(), connect_id)
+                self.chap.send_data(data.decode(), connect_id)
             else:
                 if connect_id in self.connect_id_writer_map:  # 防止重复关闭
-                    await self.handle_close(connect_id)
+                    self.handle_close(connect_id)
                 break
 
-    async def handle_close(self, connect_id):
+    def handle_close(self, connect_id):
         if isinstance(self, slave):
             print('local server close, connect_id:', connect_id)
         elif isinstance(self, server):
             print('remote client close, connect_id:', connect_id)
-        await self.chap.send_disconnect(connect_id)
+        self.chap.send_disconnect(connect_id)
         writer = self.connect_id_writer_map.pop(connect_id)
         writer.close()
 
@@ -63,8 +63,8 @@ class lcx:
 
 
 class slave(lcx):
-    def __init__(self, args):
-        super().__init__()
+    def __init__(self, args, loop):
+        super().__init__(loop)
         local_socket = args.local_socket.split(':', 1)
         self.conn_srv = local_socket[0]
         self.conn_port = chap.base_chap.check_port(local_socket[1])
@@ -73,41 +73,47 @@ class slave(lcx):
 
     async def open_connection(self, packet):
         request_id = self.peer.parse_connect_request(packet)
-        reader, writer = await asyncio.open_connection(self.conn_srv, self.conn_port, loop=self.loop)
-        connect_id = await self.peer.send_connect_response(request_id)
-        self.connect_id_writer_map[connect_id] = writer
-        self.loop.create_task(self.data_transmit(reader, connect_id))
+        try:
+            reader, writer = await asyncio.open_connection(self.conn_srv, self.conn_port, loop=self.loop)
+        except ConnectionRefusedError:
+            print('connect local server {}:{} failed!'.format(self.conn_srv, self.conn_port))
+            self.peer.send_connect_response(request_id, False)
+        else:
+            connect_id = self.peer.send_connect_response(request_id, True)
+            self.connect_id_writer_map[connect_id] = writer
+            self.loop.create_task(self.data_transmit(reader, connect_id))
 
 
 class server(lcx):
-    def __init__(self, args):
-        super().__init__()
-        self.loop = asyncio.get_event_loop()
-        self.chap = self.authenticator = chap.authenticator(args, self.loop)  # handshake first
+    def __init__(self, args, loop):
+        super().__init__(loop)
         self.request_id_remote_client_map = {}
+        self.chap = self.authenticator = chap.authenticator(args, self.loop)  # handshake first
         self.start_server()
 
     def start_server(self):
         coro = asyncio.start_server(self.handle_connect, '0.0.0.0',
                                     self.authenticator.bind_port,
                                     loop=self.loop)
-        self.server_ = self.loop.run_until_complete(coro)
+        self.server = self.loop.run_until_complete(coro)
         print('listening at 0.0.0.0:{}......'.format(self.authenticator.bind_port))
-        self.loop.create_task(self.dispatch())
-        self.loop.run_forever()
+        self.loop.run_until_complete(self.dispatch())
 
-    async def handle_connect(self, reader, writer):
+    def handle_connect(self, reader, writer):
         peer_host, peer_port, = writer.get_extra_info('peername')
-        print('[+]connect from: {}:{}'.format(peer_host, peer_port))
-        request_id = await self.authenticator.send_connect_request()
+        print('[+]connection from: {}:{}'.format(peer_host, peer_port))
+        request_id = self.authenticator.send_connect_request()
         remote_client = collections.namedtuple('remote_client', ['reader', 'writer'])
         self.request_id_remote_client_map[request_id] = remote_client._make([reader, writer])
 
     def handle_connect_response(self, packet):
-        request_id, connect_id = self.authenticator.parse_connect_response(packet)
+        request_id, result, connect_id = self.authenticator.parse_connect_response(packet)
         remote_client = self.request_id_remote_client_map.pop(request_id)
-        self.connect_id_writer_map[connect_id] = remote_client.writer
-        self.loop.create_task(self.data_transmit(remote_client.reader, connect_id))
+        if result:
+            self.connect_id_writer_map[connect_id] = remote_client.writer
+            self.loop.create_task(self.data_transmit(remote_client.reader, connect_id))
+        else:
+            remote_client.writer.close()
 
 
 def arg_parse():
@@ -131,11 +137,20 @@ def arg_parse():
 
 
 def main():
+    loop = asyncio.get_event_loop()
     args = arg_parse()
-    if args.mode == 'listen':
-        server(args)
-    elif args.mode == 'slave':
-        slave(args)
+    try:
+        if args.mode == 'listen':
+            server(args, loop)
+        elif args.mode == 'slave':
+            slave(args, loop)
+    except KeyboardInterrupt:
+        for task in asyncio.Task.all_tasks():
+            task.cancel()
+        loop.stop()
+        loop.run_forever()
+    finally:
+        loop.close()
 
 
 if __name__ == '__main__':
