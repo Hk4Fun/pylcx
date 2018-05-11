@@ -1,0 +1,119 @@
+changeset:   1249:85ec2c5de232
+tag:         tip
+user:        Victor Stinner <victor.stinner@gmail.com>
+date:        Wed Jul 16 13:37:00 2014 +0200
+files:       asyncio/windows_events.py
+description:
+Add add_signal_handler() and remove_signal_handler() on Windows
+SelectorEventLoop.
+
+
+diff -r b5b973ffee7e -r 85ec2c5de232 asyncio/windows_events.py
+--- a/asyncio/windows_events.py	Tue Jul 15 23:42:02 2014 +0200
++++ b/asyncio/windows_events.py	Wed Jul 16 13:37:00 2014 +0200
+@@ -127,9 +127,104 @@ class PipeServer(object):
+ class _WindowsSelectorEventLoop(selector_events.BaseSelectorEventLoop):
+     """Windows version of selector event loop."""
+ 
++    def __init__(self, selector=None):
++        super().__init__(selector)
++        self._signal_handlers = {}
++
+     def _socketpair(self):
+         return windows_utils.socketpair()
+ 
++    def _check_signal(self, sig):
++        """Internal helper to validate a signal.
++
++        Raise ValueError if the signal number is invalid or uncatchable.
++        Raise RuntimeError if there is a problem setting up the handler.
++        """
++        if not isinstance(sig, int):
++            raise TypeError('sig must be an int, not {!r}'.format(sig))
++
++        if sig != signal.SIGINT:
++            raise ValueError("only SIGINT signal is supported on Windows")
++
++    def add_signal_handler(self, sig, callback, *args):
++        """Add a handler for a signal.
++
++        Raise ValueError if the signal number is invalid or uncatchable.
++        Raise RuntimeError if there is a problem setting up the handler.
++        """
++        self._check_signal(sig)
++        try:
++            # set_wakeup_fd() raises ValueError if this is not the
++            # main thread.  By calling it early we ensure that an
++            # event loop running in another thread cannot add a signal
++            # handler.
++            signal.set_wakeup_fd(self._csock.fileno())
++        except ValueError as exc:
++            raise RuntimeError(str(exc))
++
++        handle = events.Handle(callback, args, self)
++        self._signal_handlers[sig] = handle
++
++        try:
++            signal.signal(sig, self._handle_signal)
++            # Set SA_RESTART to limit EINTR occurrences.
++            # signal.siginterrupt(sig, False)
++        except OSError as exc:
++            del self._signal_handlers[sig]
++            if not self._signal_handlers:
++                try:
++                    signal.set_wakeup_fd(-1)
++                except ValueError as nexc:
++                    logger.info('set_wakeup_fd(-1) failed: %s', nexc)
++
++            if exc.errno == errno.EINVAL:
++                raise RuntimeError('sig {} cannot be caught'.format(sig))
++            else:
++                raise
++
++    def _handle_signal(self, sig, arg):
++        """Internal helper that is the actual signal handler."""
++        handle = self._signal_handlers.get(sig)
++        if handle is None:
++            return  # Assume it's some race condition.
++        if handle._cancelled:
++            self.remove_signal_handler(sig)  # Remove it properly.
++        else:
++            self._add_callback_signalsafe(handle)
++
++    def remove_signal_handler(self, sig):
++        """Remove a handler for a signal.  UNIX only.
++
++        Return True if a signal handler was removed, False if not.
++        """
++        self._check_signal(sig)
++        try:
++            del self._signal_handlers[sig]
++        except KeyError:
++            return False
++
++        if sig == signal.SIGINT:
++            handler = signal.default_int_handler
++        else:
++            # FIXME: dead code?
++            handler = signal.SIG_DFL
++
++        try:
++            signal.signal(sig, handler)
++        except OSError as exc:
++            if exc.errno == errno.EINVAL:
++                raise RuntimeError('sig {} cannot be caught'.format(sig))
++            else:
++                raise
++
++        if not self._signal_handlers:
++            try:
++                signal.set_wakeup_fd(-1)
++            except ValueError as exc:
++                logger.info('set_wakeup_fd(-1) failed: %s', exc)
++
++        return True
++
+ 
+ class ProactorEventLoop(proactor_events.BaseProactorEventLoop):
+     """Windows version of proactor event loop using IOCP."""
+
