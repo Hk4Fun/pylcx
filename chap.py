@@ -3,7 +3,6 @@ __date__ = '2018/5/5 11:15'
 
 import hashlib
 import random
-import socket
 import struct
 import argparse
 import sys
@@ -15,7 +14,6 @@ from chap_exception import *
 header_len = 4
 
 # Constants used in the protocol fields
-# AUTH_REQUEST_CODE = 0x00
 CHALLENGE_CODE = 0x01
 RESPONSE_CODE = 0x02
 SUCCESS_CODE = 0x03
@@ -25,7 +23,7 @@ BIND_RESPONSE_CODE = 0x06
 CONNECT_REQUEST_CODE = 0x07
 CONNECT_RESPONSE_CODE = 0x08
 DATA_CODE = 0x09
-DISCONNECT_CODE = 0x10
+DISCONNECT_CODE = 0x0a
 
 
 class base_chap:
@@ -145,7 +143,7 @@ class peer(base_chap):
 
     async def connect(self):
         wait_time = 2
-        while True:
+        while True: # Automatic reconnection after failed connection
             try:
                 self.reader, self.writer = await asyncio.open_connection(self.authenticator,
                                                                          self.port, loop=self.loop)

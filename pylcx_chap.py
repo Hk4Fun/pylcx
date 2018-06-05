@@ -165,7 +165,7 @@ def main():
     loop = asyncio.get_event_loop()
     # https://bugs.python.org/issue23057
     # https://github.com/python/asyncio/issues/191
-    loop.add_signal_handler(getattr(signal, 'SIGINT'), functools.partial(stopper, 'SIGINT', loop))
+    # loop.add_signal_handler(getattr(signal, 'SIGINT'), functools.partial(stopper, 'SIGINT', loop))
     args = arg_parse()
 
     if args.mode == 'listen':
