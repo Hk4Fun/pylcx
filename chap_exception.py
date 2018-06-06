@@ -47,4 +47,4 @@ class RequestIdException(ChapError):
         self.error_id = error_id
 
     def __str__(self):
-        return 'Error connect_id {}'.format(self.error_id)
+        return 'Error request_id {}'.format(self.error_id)
