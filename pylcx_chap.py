@@ -41,13 +41,13 @@ class lcx:
     def chap_transmit(self, packet):
         connect_id, data = self.chap.parse_data(packet)
         writer = self.connect_id_writer_map[connect_id]
-        writer.write(bytes(data.encode()))
+        writer.write(data)
 
     async def data_transmit(self, reader, connect_id):
         while True:
             data = await reader.read(4096)
             if data:
-                self.chap.send_data(data.decode(), connect_id)
+                self.chap.send_data(data, connect_id)
             else:
                 if connect_id in self.connect_id_writer_map:  # prevent reclosing
                     self.handle_close(connect_id)

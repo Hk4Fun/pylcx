@@ -97,19 +97,20 @@ class base_chap:
         pack_format = '!BBH' + str(data_len) + 's'
 
         if isinstance(data, str):
-            data = bytes(data.encode())
+            data = data.encode()
 
         return struct.pack(pack_format, code, self.identifier, packet_len, data)
 
     def send_data(self, data, connect_id):
         code = DATA_CODE
-        data = connect_id + '#' + data
+        data = connect_id.encode() + b'#' + data
         self.send_packet(self.create_protocol_packet(code, data))
 
     @check_code(DATA_CODE)
     @check_identifier
     def parse_data(self, packet):
-        connect_id, data = packet['data'].decode().split('#', 1)
+        connect_id, data = packet['data'].split(b'#', 1)
+        connect_id = connect_id.decode()
         if connect_id not in self.connect_id:
             raise ConnectIdException(connect_id)
         print('Data from connect_id ', connect_id)
