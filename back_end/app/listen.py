@@ -71,7 +71,7 @@ async def listen_do_client(reader, writer):
             writer.close()
             return
         else:
-            traffic.upload += len(data)  # / 1024 / 1024
+            traffic.upload += len(data) / 1024 / 1024
             traffic.used += len(data)
             msg_send('R', writer_for_slave, 'BHS', Cmd.data, conn_id, data)
 
@@ -174,6 +174,6 @@ async def listen_do_slave(reader, writer):
                         writer_for_client.close()
                         listen_conn_dict.pop(conn_id)
                 else:
-                    traffic.download += len(data)  # / 1024 / 1024
+                    traffic.download += len(data) / 1024 / 1024
                     traffic.used += len(data)
                     raw_send('R', writer_for_client, data)
