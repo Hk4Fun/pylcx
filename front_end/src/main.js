@@ -14,12 +14,12 @@ import 'animate.css'
 Vue.config.productionTip = false;
 Vue.use(ElementUI);
 Vue.use(VueAxios, axios);
-Vue.use(VueNativeSock, 'ws://192.168.1.100:8000/online_users');
+Vue.use(VueNativeSock, 'ws://59.110.238.88:8000/online_users');
 Vue.component(VeLine.name, VeLine);
 Vue.component(VePie.name, VePie);
 
 axios.defaults.timeout = 5000;
-axios.defaults.baseURL ='http://192.168.1.100:8000';
+axios.defaults.baseURL ='http://59.110.238.88:8000';
 
 new Vue({
   router,
