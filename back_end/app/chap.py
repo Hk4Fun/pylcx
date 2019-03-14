@@ -68,7 +68,7 @@ async def msg_recv(role, reader, writer, fmt, *expect_cmds):
         writer.close()
         return
 
-    log.info('S L{}R C {} {:5} < {:5} {}'.format(direct, Cmd(int(msg[0])).name, self_port, peer_port, result[2:]))
+    log.debug('S L{}R C {} {:5} < {:5} {}'.format(direct, Cmd(int(msg[0])).name, self_port, peer_port, result[2:]))
     result[0] = False
     return result
 
@@ -80,7 +80,7 @@ def msg_send(role, writer, fmt, *args):
     peer_host, peer_port, = writer.get_extra_info('peername')
     self_host, self_port, = writer.get_extra_info('sockname')
 
-    log.info('S L{}R C {} {:5} > {:5} {}'.format(direct, args[0].name, self_port, peer_port, args[1:]))
+    log.debug('S L{}R C {} {:5} > {:5} {}'.format(direct, args[0].name, self_port, peer_port, args[1:]))
 
     struct_fmt = '!'
     struct_args = []
@@ -107,7 +107,7 @@ async def raw_recv(role, reader, writer):
     try:
         data = await reader.read(65530)  # max data_content is 65528 = 65535 - 1(cmd) - 2(conn_id) -2(data_len)
         if not data:
-            log.info('S{}L R{}C shut {} < {}'.format(direct[0], direct[1], self_port, peer_port))
+            log.debug('S{}L R{}C shut {} < {}'.format(direct[0], direct[1], self_port, peer_port))
             writer.close()
             return
     except Exception as e:
@@ -115,7 +115,7 @@ async def raw_recv(role, reader, writer):
         writer.close()
         raise
     else:
-        log.info('S{}L R{}C recv {} < {} {}'.format(direct[0], direct[1], self_port, peer_port, data))
+        log.debug('S{}L R{}C recv {} < {} {}'.format(direct[0], direct[1], self_port, peer_port, data))
         return data
 
 
@@ -126,5 +126,5 @@ def raw_send(role, writer, data):
     _, peer_port, = writer.get_extra_info('peername')
     _, self_port, = writer.get_extra_info('sockname')
 
-    log.info('S{}L R{}C send {} > {} {}'.format(direct[0], direct[1], self_port, peer_port, data))
+    log.debug('S{}L R{}C send {} > {} {}'.format(direct[0], direct[1], self_port, peer_port, data))
     writer.write(data)

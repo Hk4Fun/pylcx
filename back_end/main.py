@@ -1,26 +1,9 @@
-import argparse
 import asyncio
 
-from app import loop, log
+from app import loop, log, args, parser
 
 
 def main():
-    parser = argparse.ArgumentParser(description='async LCX with CHAP')
-    subparsers = parser.add_subparsers(dest='mode', help='choose a mode to run')
-
-    parser_listen = subparsers.add_parser('listen', help='run in listen mode')
-    parser_listen.add_argument('-p', dest='port', required=True, type=int, help='Port listen for slave side')
-    parser_listen.add_argument('-a', dest='addr', default='0.0.0.0:8000',
-                               help='Address for a web server to manage users, default 0.0.0.0:8000')
-
-    parser_slave = subparsers.add_parser('slave', help='run in slave mode')
-    parser_slave.add_argument('-b', dest='bind', type=int, default=0,
-                              help='Open a bind port at remote listen, connected by remote client, '
-                                   'default 0 (random port)')
-    parser_slave.add_argument('-l', dest='local', required=True, help='Local server address in format host:port')
-    parser_slave.add_argument('-r', dest='remote', required=True, help='Remote listen address in format host:port')
-    parser_slave.add_argument('-u', dest='user', required=True, help='User in format username:password')
-    args = parser.parse_args()
     server = None
     try:
         if args.mode == 'listen':

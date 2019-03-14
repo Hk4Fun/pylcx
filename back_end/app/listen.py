@@ -72,7 +72,7 @@ async def listen_do_client(reader, writer):
             return
         else:
             traffic.upload += len(data) / 1024 / 1024
-            traffic.used += len(data)
+            traffic.used += len(data) / 1024 / 1024
             msg_send('R', writer_for_slave, 'BHS', Cmd.data, conn_id, data)
 
 
@@ -175,5 +175,5 @@ async def listen_do_slave(reader, writer):
                         listen_conn_dict.pop(conn_id)
                 else:
                     traffic.download += len(data) / 1024 / 1024
-                    traffic.used += len(data)
+                    traffic.used += len(data) / 1024 / 1024
                     raw_send('R', writer_for_client, data)
